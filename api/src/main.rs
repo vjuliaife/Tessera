@@ -1,0 +1,174 @@
+//! Stellar RWA API — a read-only REST index of tokenized real-world asset
+//! activity on Stellar.
+//!
+//! The server starts the background indexer (which polls Soroban RPC every 10s)
+//! and serves the current in-memory snapshot over HTTP. It holds no secrets,
+//! signs nothing, and never mutates on-chain state. The `signer` module it also
+//! ships is the HSM-backed signing path for the trusted jobs that *do* submit
+//! transactions (dividends, rent, registry updates): the Stellar key stays
+//! inside AWS KMS and only a signature ever leaves it.
+
+pub mod audit;
+#[expect(
+    dead_code,
+    reason = "cache policy helpers are staged until response-cache integration"
+)]
+mod cache;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "DbRouter::route/primary gain callers with the PostgreSQL persistence layer (#42)"
+    )
+)]
+mod db;
+mod healthcheck;
+mod indexer;
+mod middleware;
+mod models;
+mod routes;
+mod services;
+pub mod storage;
+mod ws;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use indexer::{AppState, Config, Indexer};
+use metrics_exporter_prometheus::PrometheusBuilder;
+use tokio::sync::watch;
+
+#[tokio::main]
+async fn main() {
+    // Container health probe (#26): the distroless image has no curl/shell.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        std::process::exit(healthcheck::run());
+    }
+
+    init_tracing();
+
+    let config = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "config validation failed; exiting");
+            std::process::exit(1);
+        }
+    };
+    // `tessera-api replay ...` (issue #104): admin backfill, then exit.
+    if std::env::args().nth(1).as_deref() == Some("replay") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(indexer::replay::run_cli(&rest, &config).await);
+    }
+    tracing::info!(
+        rpc = ?config.rpc_urls,
+        registry = %config.registry_id,
+        "starting stellar-rwa-api"
+    );
+
+    let metrics_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+
+    // Issue #7: `active_websocket_connections` gauge. The API currently only
+    // serves plain HTTP (see the module doc above — it's a read-only REST
+    // index), so this is wired up and registered at `0` rather than left
+    // out entirely; it becomes live the moment a WebSocket handshake
+    // handler is added, without a metric-name/dashboard-panel change.
+    metrics::gauge!("active_websocket_connections").set(0.0);
+
+    let state = AppState::new(config, metrics_handle);
+
+    // Shared shutdown flag: flipped once by `shutdown_signal` and observed
+    // by the indexer's poll loop so it stops issuing new refresh cycles
+    // once the process is terminating, rather than racing shutdown.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Issue #95: probe read replicas for availability and replication lag.
+    match db::DbRouter::from_env() {
+        Ok(Some(router)) => Arc::new(router).spawn_health_monitor(shutdown_rx.clone()),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "database config validation failed; exiting");
+            std::process::exit(1);
+        }
+    }
+
+    // Spawn the indexer; it owns its own clone of the shared state.
+    let indexer = Indexer::new(state.clone());
+    tokio::spawn(async move { indexer.run(shutdown_rx).await });
+
+    let app = routes::router(state).layer(tower_http::trace::TraceLayer::new_for_http());
+
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = %e, %addr, "failed to bind");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(%addr, "listening");
+
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx))
+    .await
+    {
+        tracing::error!(error = %e, "server error");
+        std::process::exit(1);
+    }
+    tracing::info!("shut down cleanly");
+}
+
+/// Resolve when the process receives Ctrl-C (SIGINT) or SIGTERM, for
+/// graceful shutdown. Axum stops accepting new connections and lets
+/// in-flight requests finish once this future resolves; we also flip
+/// `shutdown_tx` so the indexer's poll loop halts rather than starting
+/// another refresh cycle mid-shutdown.
+async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to install Ctrl-C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => tracing::error!(error = %e, "failed to install SIGTERM handler"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("shutdown signal received; finishing in-flight requests");
+    let _ = shutdown_tx.send(true);
+}
+
+fn init_tracing() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("tessera_api=info,tower_http=warn"));
+    tracing_subscriber::registry()
+        .with(filter)
+        // Issue #103: every log record is PII-scrubbed before it is written.
+        .with(fmt::layer().with_writer(middleware::pii_scrubber::ScrubbingMakeWriter))
+        .init();
+}
+pub mod graphql;
+pub mod events;
